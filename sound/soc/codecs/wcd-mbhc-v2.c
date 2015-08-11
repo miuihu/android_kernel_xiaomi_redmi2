@@ -318,6 +318,7 @@ static bool wcd_mbhc_is_hph_pa_on(struct snd_soc_codec *codec)
 static void wcd_mbhc_set_and_turnoff_hph_padac(struct wcd_mbhc *mbhc)
 {
 	u8 wg_time;
+	u8 state = 0;
 	struct snd_soc_codec *codec = mbhc->codec;
 
 	wg_time = snd_soc_read(codec, MSM8X16_WCD_A_ANALOG_RX_HPH_CNP_WG_TIME);
@@ -332,8 +333,12 @@ static void wcd_mbhc_set_and_turnoff_hph_padac(struct wcd_mbhc *mbhc)
 	} else {
 		pr_debug("%s PA is off\n", __func__);
 	}
-	snd_soc_update_bits(codec, MSM8X16_WCD_A_ANALOG_RX_HPH_CNP_EN,
-			    0x30, 0x00);
+	state = gpio_get_value(EXT_SPK_AMP_GPIO);
+	pr_debug("%s external audio pa state:%d\n", __func__,state);
+	if(!state) {
+		snd_soc_update_bits(codec, MSM8X16_WCD_A_ANALOG_RX_HPH_CNP_EN,
+				    0x30, 0x00);
+	}
 	usleep_range(wg_time * 1000, wg_time * 1000 + 50);
 }
 

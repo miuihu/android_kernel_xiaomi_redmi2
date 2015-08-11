@@ -2,6 +2,7 @@
  *
  * Copyright (C) 2007-2008 HTC Corporation.
  * Author: Hou-Kun Chen <houkun.chen@gmail.com>
+ * Copyright (C) 2015 Balázs Triszka <balika011@protonmail.ch>
  *
  * This software is licensed under the terms of the GNU General Public
  * License version 2, as published by the Free Software Foundation, and
@@ -14,14 +15,10 @@
  *
  */
 
-/*#define DEBUG*/
-/*#define VERBOSE_DEBUG*/
-
 #include <linux/akm09911.h>
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/freezer.h>
-#include <linux/gpio.h>
 #include <linux/i2c.h>
 #include <linux/input.h>
 #include <linux/interrupt.h>
@@ -32,11 +29,9 @@
 #include <linux/uaccess.h>
 #include <linux/workqueue.h>
 #include <linux/regulator/consumer.h>
-#include <linux/of_gpio.h>
 #include <linux/sensors.h>
 
 #define AKM_DEBUG_IF			0
-#define AKM_HAS_RESET			1
 #define AKM_INPUT_DEVICE_NAME	"compass"
 #define AKM_DRDY_TIMEOUT_MS		100
 #define AKM_BASE_NUM			10
@@ -62,9 +57,6 @@ struct akm_compass_data {
 	struct input_dev	*input;
 	struct device		*class_dev;
 	struct class		*compass;
-	struct pinctrl		*pinctrl;
-	struct pinctrl_state	*pin_default;
-	struct pinctrl_state	*pin_sleep;
 	struct sensors_classdev	cdev;
 	struct delayed_work	dwork;
 	struct mutex		op_mutex;
@@ -96,7 +88,6 @@ struct akm_compass_data {
 
 	char	layout;
 	int	irq;
-	int	gpio_rstn;
 	int	power_enabled;
 	int	auto_report;
 	struct regulator	*vdd;
@@ -264,50 +255,6 @@ static int AKECS_Set_PowerDown(
 
 	mutex_unlock(&akm->sensor_mutex);
 	/***** unlock *****/
-
-	return err;
-}
-
-static int AKECS_Reset(
-	struct akm_compass_data *akm,
-	int hard)
-{
-	int err;
-
-#if AKM_HAS_RESET
-	uint8_t buffer[2];
-
-	/***** lock *****/
-	mutex_lock(&akm->sensor_mutex);
-
-	if (hard != 0) {
-		gpio_set_value(akm->gpio_rstn, 0);
-		udelay(5);
-		gpio_set_value(akm->gpio_rstn, 1);
-		/* No error is returned */
-		err = 0;
-	} else {
-		buffer[0] = AKM_REG_RESET;
-		buffer[1] = AKM_RESET_DATA;
-		err = akm_i2c_txdata(akm->i2c, buffer, 2);
-		if (err < 0) {
-			dev_err(&akm->i2c->dev,
-				"%s: Can not set SRST bit.", __func__);
-		} else {
-			dev_dbg(&akm->i2c->dev, "Soft reset is done.");
-		}
-	}
-	/* Device will be accessible 100 us after */
-	udelay(100);
-	/* Clear status */
-	akm->is_busy = 0;
-	atomic_set(&akm->drdy, 0);
-	mutex_unlock(&akm->sensor_mutex);
-	/***** unlock *****/
-
-#else
-	err = AKECS_Set_PowerDown(akm);
-#endif
 
 	return err;
 }
@@ -583,7 +530,7 @@ AKECS_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		break;
 	case ECS_IOCTL_RESET:
 		dev_vdbg(&akm->i2c->dev, "IOCTL_RESET called.");
-		ret = AKECS_Reset(akm, akm->gpio_rstn);
+		ret = AKECS_Set_PowerDown(akm);
 		if (ret < 0)
 			return ret;
 		break;
@@ -1466,10 +1413,6 @@ static int akm_compass_suspend(struct device *dev)
 	if (akm->state.power_on)
 		akm_compass_power_set(akm, false);
 
-	ret = pinctrl_select_state(akm->pinctrl, akm->pin_sleep);
-	if (ret)
-		dev_err(dev, "Can't select pinctrl state\n");
-
 	dev_dbg(&akm->i2c->dev, "suspended\n");
 
 	return ret;
@@ -1479,10 +1422,6 @@ static int akm_compass_resume(struct device *dev)
 {
 	struct akm_compass_data *akm = dev_get_drvdata(dev);
 	int ret = 0;
-
-	ret = pinctrl_select_state(akm->pinctrl, akm->pin_default);
-	if (ret)
-		dev_err(dev, "Can't select pinctrl state\n");
 
 	if (akm->state.power_on) {
 		ret = akm_compass_power_set(akm, true);
@@ -1696,15 +1635,6 @@ static int akm_compass_parse_dt(struct device *dev,
 	else
 		s_akm->auto_report = 0;
 
-	s_akm->gpio_rstn = of_get_named_gpio_flags(dev->of_node,
-			"akm,gpio_rstn", 0, NULL);
-
-	if (!gpio_is_valid(s_akm->gpio_rstn)) {
-		dev_err(dev, "gpio reset pin %d is invalid.\n",
-			s_akm->gpio_rstn);
-		return -EINVAL;
-	}
-
 	return 0;
 }
 #else
@@ -1714,31 +1644,6 @@ static int akm_compass_parse_dt(struct device *dev,
 	return -EINVAL;
 }
 #endif /* !CONFIG_OF */
-
-static int akm_pinctrl_init(struct akm_compass_data *s_akm)
-{
-	struct i2c_client *client = s_akm->i2c;
-
-	s_akm->pinctrl = devm_pinctrl_get(&client->dev);
-	if (IS_ERR_OR_NULL(s_akm->pinctrl)) {
-		dev_err(&client->dev, "Failed to get pinctrl\n");
-		return PTR_ERR(s_akm->pinctrl);
-	}
-
-	s_akm->pin_default = pinctrl_lookup_state(s_akm->pinctrl, "default");
-	if (IS_ERR_OR_NULL(s_akm->pin_default)) {
-		dev_err(&client->dev, "Failed to look up default state\n");
-		return PTR_ERR(s_akm->pin_default);
-	}
-
-	s_akm->pin_sleep = pinctrl_lookup_state(s_akm->pinctrl, "sleep");
-	if (IS_ERR_OR_NULL(s_akm->pin_sleep)) {
-		dev_err(&client->dev, "Failed to look up sleep state\n");
-		return PTR_ERR(s_akm->pin_sleep);
-	}
-
-	return 0;
-}
 
 static int akm_report_data(struct akm_compass_data *akm)
 {
@@ -1765,7 +1670,7 @@ static int akm_report_data(struct akm_compass_data *akm)
 	if (STATUS_ERROR(tmp)) {
 		dev_warn(&s_akm->i2c->dev, "Status error(0x%x). Reset...\n",
 			       tmp);
-		AKECS_Reset(akm, 0);
+		AKECS_Set_PowerDown(akm);
 		return -EIO;
 	}
 
@@ -1917,12 +1822,10 @@ int akm_compass_probe(struct i2c_client *client, const struct i2c_device_id *id)
 			/* Copy platform data to local. */
 			pdata = client->dev.platform_data;
 			s_akm->layout = pdata->layout;
-			s_akm->gpio_rstn = pdata->gpio_RSTN;
 		} else {
 		/* Platform data is not available.
 		   Layout and information should be set by each application. */
 			s_akm->layout = 0;
-			s_akm->gpio_rstn = 0;
 			dev_warn(&client->dev, "%s: No platform data.",
 				__func__);
 		}
@@ -1933,17 +1836,8 @@ int akm_compass_probe(struct i2c_client *client, const struct i2c_device_id *id)
 	/* set client data */
 	i2c_set_clientdata(client, s_akm);
 
-	/* initialize pinctrl */
-	if (!akm_pinctrl_init(s_akm)) {
-		err = pinctrl_select_state(s_akm->pinctrl, s_akm->pin_default);
-		if (err) {
-			dev_err(&client->dev, "Can't select pinctrl state\n");
-			goto exit2;
-		}
-	}
-
 	/* Pull up the reset pin */
-	AKECS_Reset(s_akm, 1);
+	AKECS_Set_PowerDown(s_akm);
 
 	/* check connection */
 	err = akm_compass_power_init(s_akm, 1);
@@ -2105,7 +1999,7 @@ static void __exit akm_compass_exit(void)
 module_init(akm_compass_init);
 module_exit(akm_compass_exit);
 
-MODULE_AUTHOR("viral wang <viral_wang@htc.com>");
-MODULE_DESCRIPTION("AKM compass driver");
+MODULE_AUTHOR("Balázs Triszka <balika011@protonmail.ch>");
+MODULE_DESCRIPTION("AKM09911 compass driver");
 MODULE_LICENSE("GPL");
 

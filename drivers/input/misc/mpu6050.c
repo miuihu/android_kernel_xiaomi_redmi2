@@ -29,7 +29,6 @@
 #include <linux/gpio.h>
 #include <linux/regulator/consumer.h>
 #include <linux/of_gpio.h>
-#include <mach/gpiomux.h>
 #include <linux/sensors.h>
 #include "mpu6050.h"
 
@@ -48,23 +47,25 @@
 #define MPU6050_GYRO_MIN_VALUE	-32768
 #define MPU6050_GYRO_MAX_VALUE	32767
 
-#define MPU6050_ACCEL_MIN_POLL_INTERVAL_MS	1
+/* Limit mininum delay to 10ms as we do not need higher rate so far */
+#define MPU6050_ACCEL_MIN_POLL_INTERVAL_MS	10
 #define MPU6050_ACCEL_MAX_POLL_INTERVAL_MS	5000
 #define MPU6050_ACCEL_DEFAULT_POLL_INTERVAL_MS	200
 
-#define MPU6050_GYRO_MIN_POLL_INTERVAL_MS	1
+#define MPU6050_GYRO_MIN_POLL_INTERVAL_MS	10
 #define MPU6050_GYRO_MAX_POLL_INTERVAL_MS	5000
 #define MPU6050_GYRO_DEFAULT_POLL_INTERVAL_MS	200
 
 #define MPU6050_RAW_ACCEL_DATA_LEN	6
 #define MPU6050_RAW_GYRO_DATA_LEN	6
 
-/* Sensitivity Scale Factor */
-#define MPU6050_ACCEL_SCALE_SHIFT_2G	4
-#define MPU6050_GYRO_SCALE_SHIFT_FS0	3
+#define MPU6050_RESET_SLEEP_US	10
 
 #define MPU6050_DEV_NAME_ACCEL	"accelerometer"
 #define MPU6050_DEV_NAME_GYRO	"gyroscope"
+
+#define MPU6050_PINCTRL_DEFAULT	"mpu_default"
+#define MPU6050_PINCTRL_SUSPEND	"mpu_sleep"
 
 enum mpu6050_place {
 	MPU6050_PLACE_PU = 0,
@@ -126,17 +127,24 @@ struct mpu6050_sensor {
 	enum inv_devices chip_type;
 	struct delayed_work accel_poll_work;
 	struct delayed_work gyro_poll_work;
-	struct regulator *vlogic;
-	struct regulator *vdd;
-	struct regulator *vi2c;
 	struct mpu_reg_map reg;
 	struct mpu_chip_config cfg;
 	struct axis_data axis;
 	u32 gyro_poll_ms;
 	u32 accel_poll_ms;
-	int enable_gpio;
 	bool use_poll;
+	bool wakeup_en;
+
+	/* power control */
+	struct regulator *vdd;
+	struct regulator *vi2c;
+	int enable_gpio;
 	bool power_enabled;
+
+	/* pinctrl */
+	struct pinctrl *pinctrl;
+	struct pinctrl_state *pin_default;
+	struct pinctrl_state *pin_sleep;
 };
 
 /* Accelerometer information read by HAL */
@@ -234,6 +242,28 @@ mpu6050_place_name2num[MPU6050_AXIS_REMAP_TAB_SZ] = {
 	{"Landscape Left Back Side", MPU6050_PLACE_LL_BACK},
 };
 
+/* Map gyro measurement range setting to number of bit to shift */
+static const u8 mpu_gyro_fs_shift[NUM_FSR] = {
+	GYRO_SCALE_SHIFT_FS0, /* MPU_FSR_250DPS */
+	GYRO_SCALE_SHIFT_FS1, /* MPU_FSR_500DPS */
+	GYRO_SCALE_SHIFT_FS2, /* MPU_FSR_1000DPS */
+	GYRO_SCALE_SHIFT_FS3, /* MPU_FSR_2000DPS */
+};
+
+/* Map accel measurement range setting to number of bit to shift */
+static const u8 mpu_accel_fs_shift[NUM_ACCL_FSR] = {
+	ACCEL_SCALE_SHIFT_02G, /* ACCEL_FS_02G */
+	ACCEL_SCALE_SHIFT_04G, /* ACCEL_FS_04G */
+	ACCEL_SCALE_SHIFT_08G, /* ACCEL_FS_08G */
+	ACCEL_SCALE_SHIFT_16G, /* ACCEL_FS_16G */
+};
+
+/* Function declarations */
+static void mpu6050_pinctrl_state(struct mpu6050_sensor *sensor,
+			bool active);
+static int mpu6050_set_interrupt(struct mpu6050_sensor *sensor,
+		const u8 mask, bool on);
+
 static int mpu6050_power_ctl(struct mpu6050_sensor *sensor, bool on)
 {
 	int rc = 0;
@@ -246,19 +276,10 @@ static int mpu6050_power_ctl(struct mpu6050_sensor *sensor, bool on)
 			return rc;
 		}
 
-		rc = regulator_enable(sensor->vlogic);
-		if (rc) {
-			dev_err(&sensor->client->dev,
-				"Regulator vlogic enable failed rc=%d\n", rc);
-			regulator_disable(sensor->vdd);
-			return rc;
-		}
-
 		rc = regulator_enable(sensor->vi2c);
 		if (rc) {
 			dev_err(&sensor->client->dev,
 				"Regulator vi2c enable failed rc=%d\n", rc);
-			regulator_disable(sensor->vlogic);
 			regulator_disable(sensor->vdd);
 			return rc;
 		}
@@ -268,8 +289,13 @@ static int mpu6050_power_ctl(struct mpu6050_sensor *sensor, bool on)
 			gpio_set_value(sensor->enable_gpio, 1);
 		}
 		msleep(POWER_UP_TIME_MS);
+
+		mpu6050_pinctrl_state(sensor, true);
+
 		sensor->power_enabled = true;
 	} else if (!on && (sensor->power_enabled)) {
+		mpu6050_pinctrl_state(sensor, false);
+
 		if (gpio_is_valid(sensor->enable_gpio)) {
 			udelay(POWER_EN_DELAY_US);
 			gpio_set_value(sensor->enable_gpio, 0);
@@ -280,14 +306,6 @@ static int mpu6050_power_ctl(struct mpu6050_sensor *sensor, bool on)
 		if (rc) {
 			dev_err(&sensor->client->dev,
 				"Regulator vdd disable failed rc=%d\n", rc);
-			return rc;
-		}
-
-		rc = regulator_disable(sensor->vlogic);
-		if (rc) {
-			dev_err(&sensor->client->dev,
-				"Regulator vlogic disable failed rc=%d\n", rc);
-			rc = regulator_enable(sensor->vdd);
 			return rc;
 		}
 
@@ -331,31 +349,12 @@ static int mpu6050_power_init(struct mpu6050_sensor *sensor)
 		}
 	}
 
-	sensor->vlogic = regulator_get(&sensor->client->dev, "vlogic");
-	if (IS_ERR(sensor->vlogic)) {
-		ret = PTR_ERR(sensor->vlogic);
-		dev_err(&sensor->client->dev,
-			"Regulator get failed vlogic ret=%d\n", ret);
-		goto reg_vdd_set_vtg;
-	}
-
-	if (regulator_count_voltages(sensor->vlogic) > 0) {
-		ret = regulator_set_voltage(sensor->vlogic,
-				MPU6050_VLOGIC_MIN_UV,
-				MPU6050_VLOGIC_MAX_UV);
-		if (ret) {
-			dev_err(&sensor->client->dev,
-			"Regulator set_vtg failed vlogic ret=%d\n", ret);
-			goto reg_vlogic_put;
-		}
-	}
-
 	sensor->vi2c = regulator_get(&sensor->client->dev, "vi2c");
 	if (IS_ERR(sensor->vi2c)) {
 		ret = PTR_ERR(sensor->vi2c);
 		dev_err(&sensor->client->dev,
 			"Regulator get failed vi2c ret=%d\n", ret);
-		goto reg_vlogic_set_vtg;
+		goto reg_vdd_set_vtg;
 	}
 
 	if (regulator_count_voltages(sensor->vi2c) > 0) {
@@ -374,11 +373,6 @@ static int mpu6050_power_init(struct mpu6050_sensor *sensor)
 
 reg_vi2c_put:
 	regulator_put(sensor->vi2c);
-reg_vlogic_set_vtg:
-	if (regulator_count_voltages(sensor->vlogic) > 0)
-		regulator_set_voltage(sensor->vlogic, 0, MPU6050_VLOGIC_MAX_UV);
-reg_vlogic_put:
-	regulator_put(sensor->vlogic);
 reg_vdd_set_vtg:
 	if (regulator_count_voltages(sensor->vdd) > 0)
 		regulator_set_voltage(sensor->vdd, 0, MPU6050_VDD_MAX_UV);
@@ -391,9 +385,6 @@ static int mpu6050_power_deinit(struct mpu6050_sensor *sensor)
 {
 	int ret = 0;
 
-	if (regulator_count_voltages(sensor->vlogic) > 0)
-		regulator_set_voltage(sensor->vlogic, 0, MPU6050_VLOGIC_MAX_UV);
-	regulator_put(sensor->vlogic);
 	if (regulator_count_voltages(sensor->vdd) > 0)
 		regulator_set_voltage(sensor->vdd, 0, MPU6050_VDD_MAX_UV);
 	regulator_put(sensor->vdd);
@@ -532,19 +523,34 @@ static void mpu6050_remap_gyro_data(struct axis_data *data, int place)
 static irqreturn_t mpu6050_interrupt_thread(int irq, void *data)
 {
 	struct mpu6050_sensor *sensor = data;
+	u32 shift;
 
-	mpu6050_read_accel_data(sensor, &sensor->axis);
-	mpu6050_read_gyro_data(sensor, &sensor->axis);
+	if (sensor->cfg.accel_enable) {
+		mpu6050_read_accel_data(sensor, &sensor->axis);
+		mpu6050_remap_accel_data(&sensor->axis, sensor->pdata->place);
+		shift = mpu_accel_fs_shift[sensor->cfg.accel_fs];
+		input_report_abs(sensor->accel_dev, ABS_X,
+			(sensor->axis.x >> shift));
+		input_report_abs(sensor->accel_dev, ABS_Y,
+			(sensor->axis.y >> shift));
+		input_report_abs(sensor->accel_dev, ABS_Z,
+			(sensor->axis.z >> shift));
+		input_sync(sensor->accel_dev);
+	}
 
-	input_report_abs(sensor->accel_dev, ABS_X, sensor->axis.x);
-	input_report_abs(sensor->accel_dev, ABS_Y, sensor->axis.y);
-	input_report_abs(sensor->accel_dev, ABS_Z, sensor->axis.z);
-	input_sync(sensor->accel_dev);
+	if (sensor->cfg.gyro_enable) {
+		mpu6050_read_gyro_data(sensor, &sensor->axis);
+		mpu6050_remap_gyro_data(&sensor->axis, sensor->pdata->place);
 
-	input_report_abs(sensor->gyro_dev, ABS_RX, sensor->axis.rx);
-	input_report_abs(sensor->gyro_dev, ABS_RY, sensor->axis.ry);
-	input_report_abs(sensor->gyro_dev, ABS_RZ, sensor->axis.rz);
-	input_sync(sensor->gyro_dev);
+		shift = mpu_gyro_fs_shift[sensor->cfg.fsr];
+		input_report_abs(sensor->gyro_dev, ABS_RX,
+			(sensor->axis.rx >> shift));
+		input_report_abs(sensor->gyro_dev, ABS_RY,
+			(sensor->axis.ry >> shift));
+		input_report_abs(sensor->gyro_dev, ABS_RZ,
+			(sensor->axis.rz >> shift));
+		input_sync(sensor->gyro_dev);
+	}
 
 	return IRQ_HANDLED;
 }
@@ -559,19 +565,23 @@ static irqreturn_t mpu6050_interrupt_thread(int irq, void *data)
 static void mpu6050_accel_work_fn(struct work_struct *work)
 {
 	struct mpu6050_sensor *sensor;
+	u32 shift;
+	ktime_t timestamp;
 
 	sensor = container_of((struct delayed_work *)work,
 				struct mpu6050_sensor, accel_poll_work);
 
+	timestamp = ktime_get();
 	mpu6050_read_accel_data(sensor, &sensor->axis);
 	mpu6050_remap_accel_data(&sensor->axis, sensor->pdata->place);
 
+	shift = mpu_accel_fs_shift[sensor->cfg.accel_fs];
 	input_report_abs(sensor->accel_dev, ABS_X,
-		(sensor->axis.x >> MPU6050_ACCEL_SCALE_SHIFT_2G));
+		(sensor->axis.x >> shift));
 	input_report_abs(sensor->accel_dev, ABS_Y,
-		(sensor->axis.y >> MPU6050_ACCEL_SCALE_SHIFT_2G));
+		(sensor->axis.y >> shift));
 	input_report_abs(sensor->accel_dev, ABS_Z,
-		(sensor->axis.z >> MPU6050_ACCEL_SCALE_SHIFT_2G));
+		(sensor->axis.z >> shift));
 	input_sync(sensor->accel_dev);
 
 	if (sensor->use_poll)
@@ -589,19 +599,23 @@ static void mpu6050_accel_work_fn(struct work_struct *work)
 static void mpu6050_gyro_work_fn(struct work_struct *work)
 {
 	struct mpu6050_sensor *sensor;
+	u32 shift;
+	ktime_t timestamp;
 
 	sensor = container_of((struct delayed_work *)work,
 				struct mpu6050_sensor, gyro_poll_work);
 
+	timestamp = ktime_get();
 	mpu6050_read_gyro_data(sensor, &sensor->axis);
 	mpu6050_remap_gyro_data(&sensor->axis, sensor->pdata->place);
 
+	shift = mpu_gyro_fs_shift[sensor->cfg.fsr];
 	input_report_abs(sensor->gyro_dev, ABS_RX,
-		(sensor->axis.rx >> MPU6050_GYRO_SCALE_SHIFT_FS0));
+		(sensor->axis.rx >> shift));
 	input_report_abs(sensor->gyro_dev, ABS_RY,
-		(sensor->axis.ry >> MPU6050_GYRO_SCALE_SHIFT_FS0));
+		(sensor->axis.ry >> shift));
 	input_report_abs(sensor->gyro_dev, ABS_RZ,
-		(sensor->axis.rz >> MPU6050_GYRO_SCALE_SHIFT_FS0));
+		(sensor->axis.rz >> shift));
 	input_sync(sensor->gyro_dev);
 
 	if (sensor->use_poll)
@@ -749,8 +763,8 @@ static int mpu6050_set_power_mode(struct mpu6050_sensor *sensor,
 	if (ret < 0) {
 		dev_err(&client->dev,
 				"Fail to write power mode, ret=%d\n", ret);
-	}
 		return ret;
+	}
 
 	return 0;
 }
@@ -770,7 +784,7 @@ static int mpu6050_gyro_enable(struct mpu6050_sensor *sensor, bool on)
 				sensor->reg.pwr_mgmt_1);
 	if (ret < 0) {
 		dev_err(&sensor->client->dev,
-			"Fail to get sensor power state ret=%d\n", ret);
+			"Fail to get sensor power state, ret=%d\n", ret);
 		return ret;
 	}
 
@@ -787,11 +801,39 @@ static int mpu6050_gyro_enable(struct mpu6050_sensor *sensor, bool on)
 				sensor->reg.pwr_mgmt_1, data);
 		if (ret < 0) {
 			dev_err(&sensor->client->dev,
-				"Fail to set sensor power state ret=%d\n", ret);
+				"Fail to set sensor power state, ret=%d\n",
+				ret);
 			return ret;
 		}
+
+		if (!sensor->cfg.int_enabled) {
+			ret = mpu6050_set_interrupt(sensor,
+				BIT_DATA_RDY_EN, true);
+			if (ret < 0) {
+				dev_err(&sensor->client->dev,
+					"Fail to enable interrupt mode for gyro, ret=%d\n",
+					ret);
+				return ret;
+			}
+			enable_irq(sensor->client->irq);
+			sensor->cfg.int_enabled = true;
+		}
+
 		sensor->cfg.enable = 1;
 	} else {
+		if (sensor->cfg.int_enabled && !sensor->cfg.accel_enable) {
+			ret = mpu6050_set_interrupt(sensor,
+				BIT_DATA_RDY_EN, false);
+			if (ret < 0) {
+				dev_err(&sensor->client->dev,
+					"Fail to disable interrupt mode for gyro, ret=%d\n",
+					ret);
+				return ret;
+			}
+			disable_irq(sensor->client->irq);
+			sensor->cfg.int_enabled = false;
+		}
+
 		ret = mpu6050_switch_engine(sensor, false,
 			BIT_PWR_GYRO_STBY_MASK);
 		if (ret)
@@ -803,7 +845,7 @@ static int mpu6050_gyro_enable(struct mpu6050_sensor *sensor, bool on)
 					sensor->reg.pwr_mgmt_1, data);
 			if (ret < 0) {
 				dev_err(&sensor->client->dev,
-					"Fail to set sensor power state ret=%d\n",
+					"Fail to set sensor power state, ret=%d\n",
 					ret);
 				return ret;
 			}
@@ -822,11 +864,25 @@ static int mpu6050_restore_context(struct mpu6050_sensor *sensor)
 	struct mpu_reg_map *reg;
 	struct i2c_client *client;
 	int ret;
-	u8 data;
+	u8 data, pwr_ctrl;
 
 	client = sensor->client;
 	reg = &sensor->reg;
 
+	/* Save power state and wakeup device from sleep */
+	ret = i2c_smbus_read_byte_data(client, reg->pwr_mgmt_1);
+	if (ret < 0) {
+		dev_err(&client->dev, "read power ctrl failed.\n");
+		goto exit;
+	}
+	pwr_ctrl = (u8)ret;
+
+	ret = i2c_smbus_write_byte_data(client, reg->pwr_mgmt_1,
+		BIT_WAKEUP_AFTER_RESET);
+	if (ret < 0) {
+		dev_err(&client->dev, "wakeup sensor failed.\n");
+		goto exit;
+	}
 	ret = i2c_smbus_write_byte_data(client, reg->gyro_config,
 			sensor->cfg.fsr << GYRO_CONFIG_FSR_SHIFT);
 	if (ret < 0) {
@@ -841,7 +897,7 @@ static int mpu6050_restore_context(struct mpu6050_sensor *sensor)
 	}
 
 	ret = i2c_smbus_write_byte_data(client, reg->accel_config,
-			(ACCEL_FS_02G << ACCL_CONFIG_FSR_SHIFT));
+			(sensor->cfg.accel_fs << ACCL_CONFIG_FSR_SHIFT));
 	if (ret < 0) {
 		dev_err(&client->dev, "update accel_fs failed.\n");
 		goto exit;
@@ -868,9 +924,17 @@ static int mpu6050_restore_context(struct mpu6050_sensor *sensor)
 		ret = i2c_smbus_write_byte_data(client, reg->fifo_en,
 				data |= BIT_GYRO_FIFO);
 		if (ret < 0) {
-			dev_err(&client->dev, "write accel_fifo_enabled failed.\n");
+			dev_err(&client->dev, "write gyro_fifo_enabled failed.\n");
 			goto exit;
 		}
+	}
+
+	/* Accel and Gyro should set to standby by default */
+	ret = i2c_smbus_write_byte_data(client, reg->pwr_mgmt_2,
+			BITS_PWR_ALL_AXIS_STBY);
+	if (ret < 0) {
+		dev_err(&client->dev, "set pwr_mgmt_2 failed.\n");
+		goto exit;
 	}
 
 	ret = mpu6050_set_lpa_freq(sensor, sensor->cfg.lpa_freq);
@@ -880,9 +944,23 @@ static int mpu6050_restore_context(struct mpu6050_sensor *sensor)
 	}
 
 	ret = i2c_smbus_write_byte_data(client, reg->sample_rate_div,
-			ODR_DLPF_ENA / INIT_FIFO_RATE - 1);
+			sensor->cfg.rate_div);
 	if (ret < 0) {
-		dev_err(&client->dev, "set lpa_freq failed.\n");
+		dev_err(&client->dev, "set sample_rate_div failed.\n");
+		goto exit;
+	}
+
+	ret = i2c_smbus_write_byte_data(client, reg->int_pin_cfg,
+			sensor->cfg.int_pin_cfg);
+	if (ret < 0) {
+		dev_err(&client->dev, "set int_pin_cfg failed.\n");
+		goto exit;
+	}
+
+	ret = i2c_smbus_write_byte_data(client, reg->pwr_mgmt_1,
+		pwr_ctrl);
+	if (ret < 0) {
+		dev_err(&client->dev, "write saved power state failed.\n");
 		goto exit;
 	}
 
@@ -892,13 +970,51 @@ exit:
 	return ret;
 }
 
+/**
+ * mpu6050_reset_chip - reset chip to default state
+ */
+static void mpu6050_reset_chip(struct mpu6050_sensor *sensor)
+{
+	struct i2c_client *client;
+	int ret, i;
+
+	client = sensor->client;
+
+	ret = i2c_smbus_write_byte_data(client, sensor->reg.pwr_mgmt_1,
+			BIT_RESET_ALL);
+	if (ret < 0) {
+		dev_err(&client->dev, "Reset chip fail!\n");
+		goto exit;
+	}
+	for (i = 0; i < MPU6050_RESET_RETRY_CNT; i++) {
+		ret = i2c_smbus_read_byte_data(sensor->client,
+					sensor->reg.pwr_mgmt_1);
+		if (ret < 0) {
+			dev_err(&sensor->client->dev,
+				"Fail to get reset state ret=%d\n", ret);
+			goto exit;
+		}
+
+		if ((ret & BIT_H_RESET) == 0) {
+			dev_dbg(&sensor->client->dev,
+				"Chip reset success! i=%d\n", i);
+			break;
+		}
+
+		usleep(MPU6050_RESET_SLEEP_US);
+	}
+
+exit:
+	return;
+}
+
 static int mpu6050_gyro_set_enable(struct mpu6050_sensor *sensor, bool enable)
 {
 	int ret = 0;
 
 	mutex_lock(&sensor->op_lock);
 	if (enable) {
-		if (!sensor->cfg.enable) {
+		if (!sensor->power_enabled) {
 			ret = mpu6050_power_ctl(sensor, true);
 			if (ret < 0) {
 				dev_err(&sensor->client->dev,
@@ -924,8 +1040,6 @@ static int mpu6050_gyro_set_enable(struct mpu6050_sensor *sensor, bool enable)
 		if (sensor->use_poll)
 			schedule_delayed_work(&sensor->gyro_poll_work,
 				msecs_to_jiffies(sensor->gyro_poll_ms));
-		else
-			enable_irq(sensor->client->irq);
 	} else {
 		ret = mpu6050_gyro_enable(sensor, false);
 		if (ret) {
@@ -936,17 +1050,7 @@ static int mpu6050_gyro_set_enable(struct mpu6050_sensor *sensor, bool enable)
 		}
 		if (sensor->use_poll)
 			cancel_delayed_work_sync(&sensor->gyro_poll_work);
-		else
-			disable_irq(sensor->client->irq);
 
-		if (!sensor->cfg.enable) {
-			ret = mpu6050_power_ctl(sensor, false);
-			if (ret < 0) {
-				dev_err(&sensor->client->dev,
-					"Failed to set power off mpu6050");
-				goto exit;
-			}
-		}
 	}
 
 exit:
@@ -954,9 +1058,130 @@ exit:
 	return ret;
 }
 
+/*
+  * Set interrupt enabling bits to enable/disable specific type of interrupt.
+  */
+static int mpu6050_set_interrupt(struct mpu6050_sensor *sensor,
+		const u8 mask, bool on)
+{
+	int ret;
+	u8 data;
+
+	if (sensor->cfg.is_asleep)
+		return -EINVAL;
+
+	ret = i2c_smbus_read_byte_data(sensor->client,
+				sensor->reg.int_enable);
+	if (ret < 0) {
+		dev_err(&sensor->client->dev,
+			"Fail read interrupt mode. ret=%d\n", ret);
+		return ret;
+	}
+
+	if (on) {
+		data = (u8)ret;
+		data |= mask;
+	} else {
+		data = (u8)ret;
+		data &= ~mask;
+	}
+
+	ret = i2c_smbus_write_byte_data(sensor->client,
+			sensor->reg.int_enable, data);
+	if (ret < 0) {
+		dev_err(&sensor->client->dev,
+			"Fail to set interrupt. ret=%d\n", ret);
+		return ret;
+	}
+	return 0;
+}
+
+/*
+  * Enable/disable motion detection interrupt.
+  */
+static int mpu6050_set_motion_det(struct mpu6050_sensor *sensor, bool on)
+{
+	int ret;
+
+	if (on) {
+		ret = i2c_smbus_write_byte_data(sensor->client,
+				sensor->reg.mot_thr, DEFAULT_MOT_THR);
+		if (ret < 0)
+			goto err_exit;
+
+		ret = i2c_smbus_write_byte_data(sensor->client,
+				sensor->reg.mot_dur, DEFAULT_MOT_DET_DUR);
+		if (ret < 0)
+			goto err_exit;
+
+	}
+
+	ret = mpu6050_set_interrupt(sensor, BIT_MOT_EN, on);
+	if (ret < 0)
+		goto err_exit;
+
+	sensor->cfg.mot_det_on = on;
+	/* Use default motion detection delay 4ms */
+
+	return 0;
+
+err_exit:
+	dev_err(&sensor->client->dev,
+			"Fail to set motion detection. ret=%d\n", ret);
+	return ret;
+}
+
+/* Update sensor sample rate divider upon accel and gyro polling rate. */
+static int mpu6050_config_sample_rate(struct mpu6050_sensor *sensor)
+{
+	int ret;
+	u32 delay_ms;
+	u8 div;
+
+	if (sensor->cfg.is_asleep)
+		return -EINVAL;
+
+	if (sensor->accel_poll_ms <= sensor->gyro_poll_ms)
+		delay_ms = sensor->accel_poll_ms;
+	else
+		delay_ms = sensor->gyro_poll_ms;
+
+	/* Sample_rate = internal_ODR/(1+SMPLRT_DIV) */
+	if ((sensor->cfg.lpf != MPU_DLPF_256HZ_NOLPF2) &&
+		(sensor->cfg.lpf != MPU_DLPF_RESERVED)) {
+		if (delay_ms > DELAY_MS_MAX_DLPF)
+			delay_ms = DELAY_MS_MAX_DLPF;
+		if (delay_ms < DELAY_MS_MIN_DLPF)
+			delay_ms = DELAY_MS_MIN_DLPF;
+
+		div = (u8)(((ODR_DLPF_ENA * delay_ms) / MSEC_PER_SEC) - 1);
+	} else {
+		if (delay_ms > DELAY_MS_MAX_NODLPF)
+			delay_ms = DELAY_MS_MAX_NODLPF;
+		if (delay_ms < DELAY_MS_MIN_NODLPF)
+			delay_ms = DELAY_MS_MIN_NODLPF;
+		div = (u8)(((ODR_DLPF_DIS * delay_ms) / MSEC_PER_SEC) - 1);
+	}
+
+	ret = i2c_smbus_write_byte_data(sensor->client,
+		sensor->reg.sample_rate_div, div);
+	if (ret < 0) {
+		dev_err(&sensor->client->dev,
+				"Update sample rate divdier fail, ret=%d\n",
+				ret);
+		return ret;
+	}
+
+	sensor->cfg.rate_div = div;
+
+	return 0;
+}
+
 static int mpu6050_gyro_set_poll_delay(struct mpu6050_sensor *sensor,
 					unsigned long delay)
 {
+	int ret;
+
 	mutex_lock(&sensor->op_lock);
 	if (delay < MPU6050_GYRO_MIN_POLL_INTERVAL_MS)
 		delay = MPU6050_GYRO_MIN_POLL_INTERVAL_MS;
@@ -968,6 +1193,11 @@ static int mpu6050_gyro_set_poll_delay(struct mpu6050_sensor *sensor,
 		cancel_delayed_work_sync(&sensor->gyro_poll_work);
 		schedule_delayed_work(&sensor->gyro_poll_work,
 				msecs_to_jiffies(sensor->gyro_poll_ms));
+	} else {
+		ret = mpu6050_config_sample_rate(sensor);
+		if (ret < 0)
+			dev_err(&sensor->client->dev,
+				"Unable to set polling delay for gyro!\n");
 	}
 	mutex_unlock(&sensor->op_lock);
 	return 0;
@@ -1102,7 +1332,7 @@ static int mpu6050_accel_enable(struct mpu6050_sensor *sensor, bool on)
 				sensor->reg.pwr_mgmt_1);
 	if (ret < 0) {
 		dev_err(&sensor->client->dev,
-			"Fail to get sensor power state ret=%d\n", ret);
+			"Fail to get sensor power state, ret=%d\n", ret);
 		return ret;
 	}
 
@@ -1119,11 +1349,39 @@ static int mpu6050_accel_enable(struct mpu6050_sensor *sensor, bool on)
 				sensor->reg.pwr_mgmt_1, data);
 		if (ret < 0) {
 			dev_err(&sensor->client->dev,
-				"Fail to set sensor power state ret=%d\n", ret);
+				"Fail to set sensor power state, ret=%d\n",
+				ret);
 			return ret;
 		}
+
+		if (!sensor->cfg.int_enabled) {
+			ret = mpu6050_set_interrupt(sensor,
+				BIT_DATA_RDY_EN, true);
+			if (ret < 0) {
+				dev_err(&sensor->client->dev,
+					"Fail to enable interrupt mode for accel, ret=%d\n",
+					ret);
+				return ret;
+			}
+			enable_irq(sensor->client->irq);
+			sensor->cfg.int_enabled = true;
+		}
+
 		sensor->cfg.enable = 1;
 	} else {
+		if (sensor->cfg.int_enabled && !sensor->cfg.gyro_enable) {
+			ret = mpu6050_set_interrupt(sensor,
+				BIT_DATA_RDY_EN, false);
+			if (ret < 0) {
+				dev_err(&sensor->client->dev,
+					"Fail to disable interrupt mode for accel, ret=%d\n",
+					ret);
+				return ret;
+			}
+			disable_irq(sensor->client->irq);
+			sensor->cfg.int_enabled = false;
+		}
+
 		ret = mpu6050_switch_engine(sensor, false,
 			BIT_PWR_ACCEL_STBY_MASK);
 		if (ret)
@@ -1136,7 +1394,7 @@ static int mpu6050_accel_enable(struct mpu6050_sensor *sensor, bool on)
 					sensor->reg.pwr_mgmt_1, data);
 			if (ret < 0) {
 				dev_err(&sensor->client->dev,
-					"Fail to set sensor power state ret=%d\n",
+					"Fail to set sensor power state for accel, ret=%d\n",
 					ret);
 				return ret;
 			}
@@ -1152,7 +1410,7 @@ static int mpu6050_accel_set_enable(struct mpu6050_sensor *sensor, bool enable)
 
 	mutex_lock(&sensor->op_lock);
 	if (enable) {
-		if (!sensor->cfg.enable) {
+		if (!sensor->power_enabled) {
 			ret = mpu6050_power_ctl(sensor, true);
 			if (ret < 0) {
 				dev_err(&sensor->client->dev,
@@ -1179,13 +1437,9 @@ static int mpu6050_accel_set_enable(struct mpu6050_sensor *sensor, bool enable)
 		if (sensor->use_poll)
 			schedule_delayed_work(&sensor->accel_poll_work,
 				msecs_to_jiffies(sensor->accel_poll_ms));
-		else
-			enable_irq(sensor->client->irq);
 	} else {
 		if (sensor->use_poll)
 			cancel_delayed_work_sync(&sensor->accel_poll_work);
-		else
-			disable_irq(sensor->client->irq);
 
 		ret = mpu6050_accel_enable(sensor, false);
 		if (ret) {
@@ -1195,14 +1449,6 @@ static int mpu6050_accel_set_enable(struct mpu6050_sensor *sensor, bool enable)
 			goto exit;
 		}
 
-		if (!sensor->cfg.enable) {
-			ret = mpu6050_power_ctl(sensor, false);
-			if (ret < 0) {
-				dev_err(&sensor->client->dev,
-					"Failed to set power off mpu6050");
-				goto exit;
-			}
-		}
 	}
 
 exit:
@@ -1213,7 +1459,6 @@ exit:
 static int mpu6050_accel_set_poll_delay(struct mpu6050_sensor *sensor,
 					unsigned long delay)
 {
-	u8 divider;
 	int ret;
 
 	mutex_lock(&sensor->op_lock);
@@ -1222,18 +1467,17 @@ static int mpu6050_accel_set_poll_delay(struct mpu6050_sensor *sensor,
 	if (delay > MPU6050_ACCEL_MAX_POLL_INTERVAL_MS)
 		delay = MPU6050_ACCEL_MAX_POLL_INTERVAL_MS;
 
-	if (sensor->accel_poll_ms != delay) {
-		/* Output frequency divider. and set timer delay */
-		divider = ODR_DLPF_ENA / INIT_FIFO_RATE - 1;
-		ret = i2c_smbus_write_byte_data(sensor->client,
-				sensor->reg.sample_rate_div, divider);
-		if (ret == 0)
-			sensor->accel_poll_ms = delay;
-	}
+	sensor->accel_poll_ms = delay;
+
 	if (sensor->use_poll) {
 		cancel_delayed_work_sync(&sensor->accel_poll_work);
 		schedule_delayed_work(&sensor->accel_poll_work,
 				msecs_to_jiffies(sensor->accel_poll_ms));
+	} else {
+		ret = mpu6050_config_sample_rate(sensor);
+		if (ret < 0)
+			dev_err(&sensor->client->dev,
+				"Unable to set polling delay for accel!\n");
 	}
 	mutex_unlock(&sensor->op_lock);
 	return 0;
@@ -1450,11 +1694,14 @@ static void setup_mpu6050_reg(struct mpu_reg_map *reg)
 	reg->fifo_en		= REG_FIFO_EN;
 	reg->gyro_config	= REG_GYRO_CONFIG;
 	reg->accel_config	= REG_ACCEL_CONFIG;
+	reg->mot_thr		= REG_ACCEL_MOT_THR;
+	reg->mot_dur		= REG_ACCEL_MOT_DUR;
 	reg->fifo_count_h	= REG_FIFO_COUNT_H;
 	reg->fifo_r_w		= REG_FIFO_R_W;
 	reg->raw_gyro		= REG_RAW_GYRO;
 	reg->raw_accel		= REG_RAW_ACCEL;
 	reg->temperature	= REG_TEMPERATURE;
+	reg->int_pin_cfg	= REG_INT_PIN_CFG;
 	reg->int_enable		= REG_INT_ENABLE;
 	reg->int_status		= REG_INT_STATUS;
 	reg->pwr_mgmt_1		= REG_PWR_MGMT_1;
@@ -1525,6 +1772,7 @@ static int mpu6050_init_config(struct mpu6050_sensor *sensor)
 	struct mpu_reg_map *reg;
 	struct i2c_client *client;
 	s32 ret;
+	u8 data;
 
 	if (sensor->cfg.is_asleep)
 		return -EINVAL;
@@ -1532,24 +1780,15 @@ static int mpu6050_init_config(struct mpu6050_sensor *sensor)
 	reg = &sensor->reg;
 	client = sensor->client;
 
-	/* reset device*/
-	ret = i2c_smbus_write_byte_data(client,
-		reg->pwr_mgmt_1, BIT_H_RESET);
+	mpu6050_reset_chip(sensor);
+
+	memset(&sensor->cfg, 0, sizeof(struct mpu_chip_config));
+
+	/* Wake up from sleep */
+	ret = i2c_smbus_write_byte_data(client, reg->pwr_mgmt_1,
+		BIT_WAKEUP_AFTER_RESET);
 	if (ret < 0)
 		return ret;
-	do {
-		usleep(10);
-		/* check reset complete */
-		ret = i2c_smbus_read_byte_data(client,
-			reg->pwr_mgmt_1);
-		if (ret < 0) {
-			dev_err(&client->dev,
-				"Failed to read reset status ret =%d\n",
-				ret);
-			return ret;
-		}
-	} while (ret & BIT_H_RESET);
-	memset(&sensor->cfg, 0, sizeof(struct mpu_chip_config));
 
 	/* Gyro full scale range configure */
 	ret = i2c_smbus_write_byte_data(client, reg->gyro_config,
@@ -1563,11 +1802,11 @@ static int mpu6050_init_config(struct mpu6050_sensor *sensor)
 		return ret;
 	sensor->cfg.lpf = MPU_DLPF_42HZ;
 
-	ret = i2c_smbus_write_byte_data(client, reg->sample_rate_div,
-					ODR_DLPF_ENA / INIT_FIFO_RATE - 1);
+	data = (u8)(ODR_DLPF_ENA / INIT_FIFO_RATE - 1);
+	ret = i2c_smbus_write_byte_data(client, reg->sample_rate_div, data);
 	if (ret < 0)
 		return ret;
-	sensor->cfg.fifo_rate = INIT_FIFO_RATE;
+	sensor->cfg.rate_div = data;
 
 	ret = i2c_smbus_write_byte_data(client, reg->accel_config,
 		(ACCEL_FS_02G << ACCL_CONFIG_FSR_SHIFT));
@@ -1575,12 +1814,88 @@ static int mpu6050_init_config(struct mpu6050_sensor *sensor)
 		return ret;
 	sensor->cfg.accel_fs = ACCEL_FS_02G;
 
+	if ((sensor->pdata->int_flags & IRQF_TRIGGER_FALLING) ||
+		(sensor->pdata->int_flags & IRQF_TRIGGER_LOW))
+		data = BIT_INT_CFG_DEFAULT | BIT_INT_ACTIVE_LOW;
+	else
+		data = BIT_INT_CFG_DEFAULT;
+	ret = i2c_smbus_write_byte_data(client, reg->int_pin_cfg, data);
+	if (ret < 0)
+		return ret;
+	sensor->cfg.int_pin_cfg = data;
+
+	/* Put sensor into sleep mode */
+	ret = i2c_smbus_read_byte_data(client,
+		sensor->reg.pwr_mgmt_1);
+	if (ret < 0)
+		return ret;
+
+	data = (u8)ret;
+	data |=  BIT_SLEEP;
+	ret = i2c_smbus_write_byte_data(client,
+		sensor->reg.pwr_mgmt_1, data);
+	if (ret < 0)
+		return ret;
+
 	sensor->cfg.gyro_enable = 0;
 	sensor->cfg.gyro_fifo_enable = 0;
 	sensor->cfg.accel_enable = 0;
 	sensor->cfg.accel_fifo_enable = 0;
 
 	return 0;
+}
+
+static int mpu6050_pinctrl_init(struct mpu6050_sensor *sensor)
+{
+	struct i2c_client *client = sensor->client;
+
+	sensor->pinctrl = devm_pinctrl_get(&client->dev);
+	if (IS_ERR_OR_NULL(sensor->pinctrl)) {
+		dev_err(&client->dev, "Failed to get pinctrl\n");
+		return PTR_ERR(sensor->pinctrl);
+	}
+
+	sensor->pin_default =
+		pinctrl_lookup_state(sensor->pinctrl, MPU6050_PINCTRL_DEFAULT);
+	if (IS_ERR_OR_NULL(sensor->pin_default))
+		dev_err(&client->dev, "Failed to look up default state\n");
+
+	sensor->pin_sleep =
+		pinctrl_lookup_state(sensor->pinctrl, MPU6050_PINCTRL_SUSPEND);
+	if (IS_ERR_OR_NULL(sensor->pin_sleep))
+		dev_err(&client->dev, "Failed to look up sleep state\n");
+
+	return 0;
+}
+
+static void mpu6050_pinctrl_state(struct mpu6050_sensor *sensor,
+			bool active)
+{
+	struct i2c_client *client = sensor->client;
+	int ret;
+
+	dev_dbg(&client->dev, "mpu6050_pinctrl_state en=%d\n", active);
+
+	if (active) {
+		if (!IS_ERR_OR_NULL(sensor->pin_default)) {
+			ret = pinctrl_select_state(sensor->pinctrl,
+				sensor->pin_default);
+			if (ret)
+				dev_err(&client->dev,
+					"Error pinctrl_select_state(%s) err:%d\n",
+					MPU6050_PINCTRL_DEFAULT, ret);
+		}
+	} else {
+		if (!IS_ERR_OR_NULL(sensor->pin_sleep)) {
+			ret = pinctrl_select_state(sensor->pinctrl,
+				sensor->pin_sleep);
+			if (ret)
+				dev_err(&client->dev,
+					"Error pinctrl_select_state(%s) err:%d\n",
+					MPU6050_PINCTRL_SUSPEND, ret);
+		}
+	}
+	return;
 }
 
 #ifdef CONFIG_OF
@@ -1704,6 +2019,13 @@ static int mpu6050_probe(struct i2c_client *client,
 	mutex_init(&sensor->op_lock);
 	sensor->pdata = pdata;
 	sensor->enable_gpio = sensor->pdata->gpio_en;
+
+	ret = mpu6050_pinctrl_init(sensor);
+	if (ret) {
+		dev_err(&client->dev, "Can't initialize pinctrl\n");
+		goto err_free_devmem;
+	}
+
 	if (gpio_is_valid(sensor->enable_gpio)) {
 		ret = gpio_request(sensor->enable_gpio, "MPU_EN_PM");
 		gpio_direction_output(sensor->enable_gpio, 0);
@@ -1826,6 +2148,7 @@ static int mpu6050_probe(struct i2c_client *client,
 			client->irq = 0;
 			goto err_free_gpio;
 		}
+		/* Disable interrupt until event is enabled */
 		disable_irq(client->irq);
 	} else {
 		sensor->use_poll = 1;
@@ -1974,9 +2297,27 @@ static int mpu6050_suspend(struct device *dev)
 	int ret = 0;
 
 	mutex_lock(&sensor->op_lock);
-	if (!sensor->use_poll)
+	if (sensor->cfg.accel_enable && sensor->wakeup_en) {
+		/* keep accel on and config motion detection wakeup */
+		ret = mpu6050_set_interrupt(sensor,
+				BIT_DATA_RDY_EN, false);
+		if (ret == 0)
+			ret = mpu6050_set_motion_det(sensor, true);
+		if (ret == 0) {
+			irq_set_irq_wake(client->irq, 1);
+
+			dev_dbg(&client->dev,
+				"Enable motion detection success\n");
+			goto exit;
+		}
+		/*  if motion detection config does not success,
+		  *  not exit suspend and sensor will be power off.
+		  */
+	}
+
+	if (!sensor->use_poll) {
 		disable_irq(client->irq);
-	else {
+	} else {
 		if (sensor->cfg.gyro_enable)
 			cancel_delayed_work_sync(&sensor->gyro_poll_work);
 
@@ -1984,22 +2325,18 @@ static int mpu6050_suspend(struct device *dev)
 			cancel_delayed_work_sync(&sensor->accel_poll_work);
 	}
 
-
-	if (sensor->cfg.enable) {
-		mpu6050_set_power_mode(sensor, false);
-		ret = mpu6050_power_ctl(sensor, false);
-		if (ret < 0) {
-			dev_err(&client->dev, "Power off mpu6050 failed\n");
-			goto exit;
-		}
+	mpu6050_set_power_mode(sensor, false);
+	ret = mpu6050_power_ctl(sensor, false);
+	if (ret < 0) {
+		dev_err(&client->dev, "Power off mpu6050 failed\n");
+		goto exit;
 	}
-
-	dev_dbg(&client->dev, "suspended\n");
 
 exit:
 	mutex_unlock(&sensor->op_lock);
+	dev_dbg(&client->dev, "Suspend completed, ret=%d\n", ret);
 
-	return ret;
+	return 0;
 }
 
 /**
@@ -2014,20 +2351,37 @@ static int mpu6050_resume(struct device *dev)
 	struct mpu6050_sensor *sensor = i2c_get_clientdata(client);
 	int ret = 0;
 
-	if (sensor->cfg.enable) {
-		ret = mpu6050_power_ctl(sensor, true);
-		if (ret < 0) {
-			dev_err(&client->dev, "Power off mpu6050 failed\n");
-			goto exit;
-		}
+	if (sensor->cfg.mot_det_on) {
+		/* keep accel on and config motion detection wakeup */
+		irq_set_irq_wake(client->irq, 0);
+		mpu6050_set_motion_det(sensor, false);
+		mpu6050_set_interrupt(sensor,
+				BIT_DATA_RDY_EN, true);
+		dev_dbg(&client->dev, "Disable motion detection success\n");
+		goto exit;
+	}
 
-		ret = mpu6050_restore_context(sensor);
-		if (ret < 0) {
-			dev_err(&client->dev, "Failed to restore context\n");
-			goto exit;
-		}
+	/* Keep sensor power on to prevent bad power state */
+	ret = mpu6050_power_ctl(sensor, true);
+	if (ret < 0) {
+		dev_err(&client->dev, "Power on mpu6050 failed\n");
+		goto exit;
+	}
+	/* Reset sensor to recovery from unexpected state */
+	mpu6050_reset_chip(sensor);
 
-		mpu6050_set_power_mode(sensor, true);
+	ret = mpu6050_restore_context(sensor);
+	if (ret < 0) {
+		dev_err(&client->dev, "Failed to restore context\n");
+		goto exit;
+	}
+
+	/* Enter sleep mode if both accel and gyro are not enabled */
+	ret = mpu6050_set_power_mode(sensor, sensor->cfg.enable);
+	if (ret < 0) {
+		dev_err(&client->dev, "Failed to set power mode enable=%d\n",
+					sensor->cfg.enable);
+		goto exit;
 	}
 
 	if (sensor->cfg.gyro_enable) {
@@ -2059,9 +2413,8 @@ static int mpu6050_resume(struct device *dev)
 	if (!sensor->use_poll)
 		enable_irq(client->irq);
 
-	dev_dbg(&client->dev, "resumed\n");
-
 exit:
+	dev_dbg(&client->dev, "Resume complete, ret = %d\n", ret);
 	return ret;
 }
 #endif

@@ -1845,6 +1845,10 @@ static const struct snd_kcontrol_new hphr_mux[] = {
 	SOC_DAPM_ENUM_VIRT("HPHR", hph_enum)
 };
 
+static const struct snd_kcontrol_new hphspk_mux[] = {
+	SOC_DAPM_ENUM_VIRT("HPH SPK", hph_enum)
+};
+
 static const struct snd_kcontrol_new spkr_switch[] = {
 	SOC_DAPM_SINGLE("Switch",
 		MSM8X16_WCD_A_ANALOG_SPKR_DAC_CTL, 7, 1, 0)
@@ -2614,6 +2618,9 @@ static int msm8x16_wcd_hph_pa_event(struct snd_soc_dapm_widget *w,
 			snd_soc_update_bits(codec,
 				MSM8X16_WCD_A_CDC_RX2_B6_CTL, 0x01, 0x00);
 		usleep_range(10000, 10100);
+
+		// TODO: Is hadset connected?
+		gpio_direction_output(EXT_SPK_AMP_HEADSET_GPIO, true);
 		break;
 
 	case SND_SOC_DAPM_PRE_PMD:
@@ -2656,6 +2663,8 @@ static int msm8x16_wcd_hph_pa_event(struct snd_soc_dapm_widget *w,
 			"%s: sleep 10 ms after %s PA disable.\n", __func__,
 			w->name);
 		usleep_range(10000, 10100);
+
+		gpio_direction_output(EXT_SPK_AMP_HEADSET_GPIO, false);
 		break;
 	}
 	return 0;
@@ -2692,15 +2701,20 @@ static const struct snd_soc_dapm_route audio_map[] = {
 
 	{"HPHL PA", NULL, "HPHL"},
 	{"HPHR PA", NULL, "HPHR"},
+	{"SPK EXTN PA",NULL, "HPH SPK"},
 	{"HPHL", "Switch", "HPHL DAC"},
 	{"HPHR", "Switch", "HPHR DAC"},
+	{"HPH SPK", "Switch", "HPHR DAC"},
 	{"HPHL PA", NULL, "CP"},
 	{"HPHL PA", NULL, "RX_BIAS"},
+	{"SPK EXTN PA", NULL, "CP"},
+	{"SPK EXTN PA", NULL, "RX_BIAS"},
 	{"HPHR PA", NULL, "CP"},
 	{"HPHR PA", NULL, "RX_BIAS"},
 	{"HPHL DAC", NULL, "RX1 CHAIN"},
 
 	{"SPK_OUT", NULL, "SPK PA"},
+	{"SPK_EXTN_OUT", NULL, "SPK EXTN PA"},
 	{"SPK PA", NULL, "SPK_RX_BIAS"},
 	{"SPK PA", NULL, "SPK DAC"},
 	{"SPK DAC", "Switch", "RX3 CHAIN"},
@@ -3220,11 +3234,20 @@ static const struct snd_soc_dapm_widget msm8x16_wcd_dapm_widgets[] = {
 		SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMU |
 		SND_SOC_DAPM_POST_PMD),
 
+	SND_SOC_DAPM_VIRT_MUX("HPH SPK", SND_SOC_NOPM, 0, 0, hphspk_mux),
+
+	SND_SOC_DAPM_PGA_E("SPK EXTN PA", MSM8X16_WCD_A_ANALOG_RX_HPH_CNP_EN,
+		4, 0, NULL, 0,
+		msm8x16_wcd_hph_pa_event, SND_SOC_DAPM_PRE_PMU |
+		SND_SOC_DAPM_POST_PMU | SND_SOC_DAPM_PRE_PMD |
+		SND_SOC_DAPM_POST_PMD),
+
 	SND_SOC_DAPM_MIXER("SPK DAC", SND_SOC_NOPM, 0, 0,
 		spkr_switch, ARRAY_SIZE(spkr_switch)),
 
 	/* Speaker */
 	SND_SOC_DAPM_OUTPUT("SPK_OUT"),
+	SND_SOC_DAPM_OUTPUT("SPK_EXTN_OUT"),
 
 	SND_SOC_DAPM_PGA_E("SPK PA", MSM8X16_WCD_A_ANALOG_SPKR_DRV_CTL,
 			6, 0 , NULL, 0, msm8x16_wcd_codec_enable_spk_pa,
