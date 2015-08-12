@@ -14,5 +14,4 @@ Lineout AMP support: done
 
 Known bugs:
 - hw color calibration not supported (easy to port form Redmi 1S, but almost useless)
-- proximity not wakes up the phone after call
 - light sensor needs some calibration
