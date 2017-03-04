@@ -13,5 +13,5 @@ MPU6050: done // other sensors
 Lineout AMP support: done
 
 Known bugs:
-- hw color calibration not supported (easy to port form Redmi 1S, but almost useless)
+- hw color calibration not supported (easy to port from Redmi 1S, but almost useless)
 - light sensor needs some calibration
